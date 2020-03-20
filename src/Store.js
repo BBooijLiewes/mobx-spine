@@ -280,6 +280,7 @@ export default class Store {
                     return res.response;
                 }))
                 .catch((err) => {
+                    console.log("Came in outer wrap for cancelled request");
                     this.__pendingRequestCount--;
                     throw err;
                 })
