@@ -268,17 +268,21 @@ export default class Store {
         const data = this.buildFetchData(options);
         const promise = this.wrapPendingRequestCount(
             this.__getApi()
-            .fetchStore({
-                url: options.url || result(this, 'url'),
-                data,
-                requestOptions: omit(options, 'data'),
-            })
-            .then(action(res => {
-                this.__state.totalRecords = res.totalRecords;
-                this.fromBackend(res);
+                .fetchStore({
+                    url: options.url || result(this, 'url'),
+                    data,
+                    requestOptions: omit(options, 'data'),
+                })
+                .then(action(res => {
+                    this.__state.totalRecords = res.totalRecords;
+                    this.fromBackend(res);
 
-                return res.response;
-            }))
+                    return res.response;
+                }))
+                .catch((err) => {
+                    this.__pendingRequestCount--;
+                    throw err;
+                })
         );
 
         return promise;
