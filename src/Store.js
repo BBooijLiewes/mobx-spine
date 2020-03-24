@@ -274,6 +274,8 @@ export default class Store {
                     requestOptions: omit(options, 'data'),
                 })
                 .then(action(res => {
+                    console.log("Came in outer wrap for correct request");
+
                     this.__state.totalRecords = res.totalRecords;
                     this.fromBackend(res);
 
@@ -485,14 +487,17 @@ export default class Store {
     }
 
     wrapPendingRequestCount(promise) {
+        console.log("Increasing request count")
         this.__pendingRequestCount++;
 
         return promise
             .then((res) => {
+                console.log("Decreasing request count inner after correct");
                 this.__pendingRequestCount--;
                 return res;
             })
             .catch((err) => {
+                console.log("Decreasing request count after catch");
                 this.__pendingRequestCount--;
                 throw err;
             });
