@@ -1746,7 +1746,7 @@ describe('changes', () => {
 
         animal.setInput('name', 'Lion');
 
-        expect(toJS(animal.__changes)).toEqual(['name']);
+        expect(Array.from(animal.__changes)).toEqual(['name']);
         const output2 = animal.toBackend({ onlyChanges: true });
         // `kind: 2` should not appear in here.
         expect(output2).toEqual({
@@ -1760,7 +1760,7 @@ describe('changes', () => {
 
         animal.setInput('name', 'Lino');
         animal.setInput('name', 'Lion');
-        expect(toJS(animal.__changes)).toEqual(['name']);
+        expect(Array.from(animal.__changes)).toEqual(['name']);
         const output = animal.toBackend({ onlyChanges: true });
         expect(output).toEqual({
             id: 1,

@@ -4,17 +4,28 @@ export function invariant(condition, message = 'Illegal state') {
     }
 }
 
+// Cache for attribute name conversions
+const camelToSnakeCache = new Map();
+const snakeToCamelCache = new Map();
+
 // lodash's `snakeCase` method removes dots from the string; this breaks mobx-spine
 export function camelToSnake(s) {
-    return s.replace(/([A-Z])/g, $1 => '_' + $1.toLowerCase());
+    if (!camelToSnakeCache.has(s)) {
+        camelToSnakeCache.set(s, s.replace(/([A-Z])/g, $1 => '_' + $1.toLowerCase()));
+    }
+    return camelToSnakeCache.get(s);
 }
 
 // lodash's `camelCase` method removes dots from the string; this breaks mobx-spine
 export function snakeToCamel(s) {
-    if (s.startsWith('_')) {
-        return s;
+    if (!snakeToCamelCache.has(s)) {
+        if (s.startsWith('_')) {
+            snakeToCamelCache.set(s, s);
+        } else {
+            snakeToCamelCache.set(s, s.replace(/_\w/g, m => m[1].toUpperCase()));
+        }
     }
-    return s.replace(/_\w/g, m => m[1].toUpperCase());
+    return snakeToCamelCache.get(s);
 }
 
 // ['kind.breed', 'owner'] => { 'owner': {}, 'kind': {'breed': {}}}

@@ -173,9 +173,11 @@ export default class BinderApi {
             // TODO: I really dislike that this is comma separated and not an array.
             // We should fix this in the Binder API.
             with:
-                model.__activeRelations
-                    .map(model.constructor.toBackendAttrKey)
-                    .join(',') || null,
+                (model.__activeRelations && model.__activeRelations.length > 0)
+                    ? model.__activeRelations
+                        .map(model.constructor.toBackendAttrKey)
+                        .join(',')
+                    : null,
         };
     }
 
@@ -241,9 +243,11 @@ export default class BinderApi {
         const limit = store.__limit;
         return {
             with:
-                store.__activeRelations
-                    .map(store.Model.toBackendAttrKey)
-                    .join(',') || null,
+                (store.__activeRelations && store.__activeRelations.length > 0)
+                    ? store.__activeRelations
+                        .map(store.Model.toBackendAttrKey)
+                        .join(',')
+                    : null,
             limit: limit === null ? 'none' : limit,
             // Hide offset if zero so the request looks cleaner in DevTools.
             offset: offset || null,

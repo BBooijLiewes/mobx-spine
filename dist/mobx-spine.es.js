@@ -12,21 +12,32 @@ function invariant(condition) {
     }
 }
 
+// Cache for attribute name conversions
+var camelToSnakeCache = new Map();
+var snakeToCamelCache = new Map();
+
 // lodash's `snakeCase` method removes dots from the string; this breaks mobx-spine
 function camelToSnake(s) {
-    return s.replace(/([A-Z])/g, function ($1) {
-        return '_' + $1.toLowerCase();
-    });
+    if (!camelToSnakeCache.has(s)) {
+        camelToSnakeCache.set(s, s.replace(/([A-Z])/g, function ($1) {
+            return '_' + $1.toLowerCase();
+        }));
+    }
+    return camelToSnakeCache.get(s);
 }
 
 // lodash's `camelCase` method removes dots from the string; this breaks mobx-spine
 function snakeToCamel(s) {
-    if (s.startsWith('_')) {
-        return s;
+    if (!snakeToCamelCache.has(s)) {
+        if (s.startsWith('_')) {
+            snakeToCamelCache.set(s, s);
+        } else {
+            snakeToCamelCache.set(s, s.replace(/_\w/g, function (m) {
+                return m[1].toUpperCase();
+            }));
+        }
     }
-    return s.replace(/_\w/g, function (m) {
-        return m[1].toUpperCase();
-    });
+    return snakeToCamelCache.get(s);
 }
 
 // ['kind.breed', 'owner'] => { 'owner': {}, 'kind': {'breed': {}}}
@@ -584,11 +595,14 @@ var Store = (_dec = observable.shallow, _dec2 = observable.shallow, (_class = (_
 
             var options = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
 
+            // Create shared WeakSet for tracking processed models across all serialization
+            var processedModels = new WeakSet();
+
             var relevantModels = options.onlyChanges ? this.models.filter(function (model) {
                 return model.isNew || model.hasUserChanges;
             }) : this.models;
             var modelData = relevantModels.map(function (model) {
-                return model.toBackendAll(options);
+                return model.toBackendAll(options, processedModels);
             });
 
             var data = [];
@@ -867,7 +881,7 @@ var Relation = function () {
     return Relation;
 }();
 
-var _dec$1, _dec2$1, _dec3, _dec4, _dec5, _class$1, _descriptor$1, _descriptor2$1, _descriptor3$1, _descriptor4$1, _descriptor5$1, _descriptor6$1, _class2$1, _temp$1;
+var _dec$1, _dec2$1, _dec3, _dec4, _dec5, _dec6, _class$1, _descriptor$1, _descriptor2$1, _descriptor3$1, _descriptor4$1, _descriptor5$1, _descriptor6$1, _class2$1, _temp$1;
 
 function _initDefineProp$1(target, property, descriptor, context) {
     if (!descriptor) return;
@@ -919,7 +933,7 @@ var RE_SPLIT_FIRST_RELATION = /([^.]+)\.(.+)/;
 // TODO: find a way to get a list of existing properties automatically.
 var FORBIDDEN_ATTRS = ['url', 'urlRoot', 'api', 'isNew', 'isLoading', 'parse', 'save', 'clear'];
 
-var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = observable.shallow, _dec4 = observable.shallow, _dec5 = observable.shallow, (_class$1 = (_temp$1 = _class2$1 = function () {
+var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = observable.shallow, _dec4 = observable.shallow, _dec5 = observable.shallow, _dec6 = action.bound, (_class$1 = (_temp$1 = _class2$1 = function () {
     createClass(Model, [{
         key: 'urlRoot',
 
@@ -943,7 +957,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
         // URL query params that are added to fetch requests.
 
         // Holds fields (attrs+relations) that have been changed via setInput()
-        // Use plain array since we only need to track changes, not observe the array itself
+        // Use Set for O(1) lookups instead of O(n) array.includes()
 
 
         // File state - use shallow observables
@@ -1053,7 +1067,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
 
         _initDefineProp$1(this, '__fetchParams', _descriptor3$1, this);
 
-        this.__changes = [];
+        this.__changes = new Set();
 
         _initDefineProp$1(this, '__fileChanges', _descriptor4$1, this);
 
@@ -1067,6 +1081,14 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
         this.__store = options.store;
         this.__repository = options.repository;
         this.abortController = new AbortController();
+
+        // Cache casts() result to avoid repeated method calls
+        this.__castsCache = this.casts();
+        // Cache fileFields() result
+        this.__fileFieldsCache = this.fileFields();
+        // Initialize fieldFilter cache
+        this.__fieldFilterCache = null;
+        this.__fieldFilterCacheKey = null;
 
         // Find all attributes. Not all observables are an attribute.
         forIn(this, function (value, key) {
@@ -1096,8 +1118,6 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
             this.parse(data);
         }
         this.initialize();
-
-        this.saveFile = this.saveFile.bind(this);
     }
 
     createClass(Model, [{
@@ -1146,7 +1166,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
     }, {
         key: 'clearUserFieldChanges',
         value: function clearUserFieldChanges() {
-            this.__changes = [];
+            this.__changes.clear();
         }
     }, {
         key: 'clearUserFileChanges',
@@ -1169,7 +1189,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
             this.clearUserFileChanges();
         }
 
-        // Convert to regular getter to avoid creating new function on each access
+        // Cache fieldFilter function to avoid recreating it
 
     }, {
         key: 'toBackend',
@@ -1197,7 +1217,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
                 }
                 if (!_this5.isNew && options.onlyChanges) {
                     var forceFields = options.forceFields || [];
-                    return forceFields.includes(field) || _this5.__changes.includes(field) || _this5[field] instanceof Store && _this5[field].hasSetChanges ||
+                    return forceFields.includes(field) || _this5.__changes.has(field) || _this5[field] instanceof Store && _this5[field].hasSetChanges ||
                     // isNew is always true for relations that haven't been saved.
                     // If no property has been tweaked, its id serializes as null.
                     // So, we need to skip saving the id if new and no changes.
@@ -1236,6 +1256,20 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
 
             var options = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
 
+            var _processedModels = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : null;
+
+            // Track processed models to avoid duplicate serialization
+            var isRootCall = _processedModels === null;
+            if (isRootCall) {
+                _processedModels = new WeakSet();
+            }
+
+            // Skip if already processed
+            if (_processedModels.has(this)) {
+                return { data: [], relations: {} };
+            }
+            _processedModels.add(this);
+
             var nestedRelations = options.nestedRelations || {};
             var data = this.toBackend({
                 data: options.data,
@@ -1268,7 +1302,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
                     var relBackendData = rel.toBackendAll({
                         nestedRelations: subRelations,
                         onlyChanges: options.onlyChanges
-                    });
+                    }, _processedModels);
 
                     // Sometimes the backend knows the relation by a different name, e.g. the relation is called
                     // `activities`, but the name in the backend is `activity`.
@@ -1315,8 +1349,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
     }, {
         key: '__toJSAttr',
         value: function __toJSAttr(attr, value) {
-            var casts = this.casts();
-            var cast = casts[attr];
+            var cast = this.__castsCache[attr];
             if (cast !== undefined) {
                 return toJS(cast.toJS(attr, value));
             }
@@ -1497,33 +1530,32 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
     }, {
         key: 'parse',
         value: function parse(data) {
-            var _this10 = this;
-
             invariant(isPlainObject(data), 'Parameter supplied to `parse()` is not an object, got: ' + JSON.stringify(data));
 
-            forIn(data, function (value, key) {
-                var attr = _this10.constructor.fromBackendAttrKey(key);
-                if (_this10.__attributes.includes(attr)) {
-                    _this10[attr] = _this10.__parseAttr(attr, value);
-                } else if (_this10.__activeCurrentRelations.includes(attr)) {
+            // Use native for...in for better performance than lodash forIn
+            for (var key in data) {
+                var value = data[key];
+                var attr = this.constructor.fromBackendAttrKey(key);
+                if (this.__attributes.includes(attr)) {
+                    this[attr] = this.__parseAttr(attr, value);
+                } else if (this.__activeCurrentRelations.includes(attr)) {
                     // In Binder, a relation property is an `int` or `[int]`, referring to its ID.
                     // However, it can also be an object if there are nested relations (non flattened).
                     if (isPlainObject(value) || Array.isArray(value) && value.every(isPlainObject)) {
-                        _this10[attr].parse(value);
+                        this[attr].parse(value);
                     } else if (value === null) {
                         // The relation is cleared.
-                        _this10[attr].clear();
+                        this[attr].clear();
                     }
                 }
-            });
+            }
 
             return this;
         }
     }, {
         key: '__parseAttr',
         value: function __parseAttr(attr, value) {
-            var casts = this.casts();
-            var cast = casts[attr];
+            var cast = this.__castsCache[attr];
             if (cast !== undefined) {
                 return cast.parse(attr, value);
             }
@@ -1532,7 +1564,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
     }, {
         key: 'saveFile',
         value: function saveFile(name) {
-            var _this11 = this;
+            var _this10 = this;
 
             var snakeName = camelToSnake(name);
 
@@ -1543,16 +1575,16 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
                 data.append(name, file, file.name);
 
                 return this.api.post('' + this.url + snakeName + '/', data, { headers: { 'Content-Type': 'multipart/form-data' } }).then(action(function (res) {
-                    _this11.__fileExists[name] = true;
-                    delete _this11.__fileChanges[name];
-                    _this11.saveFromBackend(res);
+                    _this10.__fileExists[name] = true;
+                    delete _this10.__fileChanges[name];
+                    _this10.saveFromBackend(res);
                 }));
             } else if (this.__fileDeletions[name]) {
                 if (this.__fileExists[name]) {
                     return this.api.delete('' + this.url + snakeName + '/').then(action(function () {
-                        _this11.__fileExists[name] = false;
-                        delete _this11.__fileDeletions[name];
-                        _this11.saveFromBackend({ data: defineProperty({}, snakeName, null) });
+                        _this10.__fileExists[name] = false;
+                        delete _this10.__fileDeletions[name];
+                        _this10.saveFromBackend({ data: defineProperty({}, snakeName, null) });
                     }));
                 } else {
                     delete this.__fileDeletions[name];
@@ -1564,13 +1596,13 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
     }, {
         key: 'saveFiles',
         value: function saveFiles() {
-            return Promise.all(this.fileFields().filter(this.fieldFilter).map(this.saveFile));
+            return Promise.all(this.__fileFieldsCache.filter(this.fieldFilter).map(this.saveFile));
         }
     }, {
         key: 'setInput',
         value: function setInput(name, value) {
             invariant(this.__attributes.includes(name) || this.__activeCurrentRelations.includes(name), 'Field `' + name + '` does not exist on the model.');
-            if (this.fileFields().includes(name)) {
+            if (this.__fileFieldsCache.includes(name)) {
                 if (this.__fileExists[name] === undefined) {
                     this.__fileExists[name] = this[name] !== null;
                 }
@@ -1601,9 +1633,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
                     value = null;
                 }
             }
-            if (!this.__changes.includes(name)) {
-                this.__changes.push(name);
-            }
+            this.__changes.add(name);
             if (this.__activeCurrentRelations.includes(name)) {
                 if (isArray(value)) {
                     this[name].clear();
@@ -1669,7 +1699,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
     }, {
         key: '_save',
         value: function _save() {
-            var _this12 = this;
+            var _this11 = this;
 
             var options = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
 
@@ -1685,17 +1715,17 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
                 isNew: this.isNew,
                 requestOptions: omit(options, 'url', 'data', 'mapData')
             }).then(action(function (res) {
-                _this12.saveFromBackend(_extends({}, res, {
-                    data: omit(res.data, _this12.fileFields().map(camelToSnake))
+                _this11.saveFromBackend(_extends({}, res, {
+                    data: omit(res.data, _this11.__fileFieldsCache.map(camelToSnake))
                 }));
-                _this12.clearUserFieldChanges();
-                return _this12.saveFiles().then(function () {
-                    _this12.clearUserFileChanges();
+                _this11.clearUserFieldChanges();
+                return _this11.saveFiles().then(function () {
+                    _this11.clearUserFileChanges();
                     return Promise.resolve(res);
                 });
             })).catch(action(function (err) {
                 if (err.valErrors) {
-                    _this12.parseValidationErrors(err.valErrors);
+                    _this11.parseValidationErrors(err.valErrors);
                 }
                 throw err;
             })));
@@ -1703,7 +1733,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
     }, {
         key: '_saveAll',
         value: function _saveAll() {
-            var _this13 = this;
+            var _this12 = this;
 
             var options = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
 
@@ -1719,10 +1749,10 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
                 }),
                 requestOptions: omit(options, 'relations', 'data', 'mapData')
             }).then(action(function (res) {
-                _this13.saveFromBackend(res);
-                _this13.clearUserFieldChanges();
+                _this12.saveFromBackend(res);
+                _this12.clearUserFieldChanges();
 
-                forNestedRelations(_this13, relationsToNestedKeys(options.relations || []), function (relation) {
+                forNestedRelations(_this12, relationsToNestedKeys(options.relations || []), function (relation) {
                     if (relation instanceof Model) {
                         relation.clearUserFieldChanges();
                     } else {
@@ -1730,10 +1760,10 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
                     }
                 });
 
-                return _this13.saveAllFiles(relationsToNestedKeys(options.relations || [])).then(function () {
-                    _this13.clearUserFileChanges();
+                return _this12.saveAllFiles(relationsToNestedKeys(options.relations || [])).then(function () {
+                    _this12.clearUserFileChanges();
 
-                    forNestedRelations(_this13, relationsToNestedKeys(options.relations || []), function (relation) {
+                    forNestedRelations(_this12, relationsToNestedKeys(options.relations || []), function (relation) {
                         if (relation instanceof Model) {
                             relation.clearUserFileChanges();
                         }
@@ -1743,7 +1773,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
                 });
             })).catch(action(function (err) {
                 if (err.valErrors) {
-                    _this13.parseValidationErrors(err.valErrors);
+                    _this12.parseValidationErrors(err.valErrors);
                 }
                 throw err;
             })));
@@ -1755,19 +1785,19 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
     }, {
         key: '__parseNewIds',
         value: function __parseNewIds(idMaps) {
-            var _this14 = this;
+            var _this13 = this;
 
             var bName = this.constructor.backendResourceName;
             if (bName && idMaps[bName]) {
                 var idMap = idMaps[bName].find(function (ids) {
-                    return ids[0] === _this14.getInternalId();
+                    return ids[0] === _this13.getInternalId();
                 });
                 if (idMap) {
                     this[this.constructor.primaryKey] = idMap[1];
                 }
             }
             each(this.__activeCurrentRelations, function (relName) {
-                var rel = _this14[relName];
+                var rel = _this13[relName];
                 rel.__parseNewIds(idMaps);
             });
         }
@@ -1779,7 +1809,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
     }, {
         key: 'parseValidationErrors',
         value: function parseValidationErrors(valErrors) {
-            var _this15 = this;
+            var _this14 = this;
 
             var bname = this.constructor.backendResourceName;
 
@@ -1792,24 +1822,24 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
                         return snakeToCamel(key);
                     });
                     var formattedErrors = mapValues(camelCasedErrors, function (valError) {
-                        return valError.map(_this15.validationErrorFormatter);
+                        return valError.map(_this14.validationErrorFormatter);
                     });
                     this.__backendValidationErrors = formattedErrors;
                 }
             }
 
             this.__activeCurrentRelations.forEach(function (currentRel) {
-                _this15[currentRel].parseValidationErrors(valErrors);
+                _this14[currentRel].parseValidationErrors(valErrors);
             });
         }
     }, {
         key: 'clearValidationErrors',
         value: function clearValidationErrors() {
-            var _this16 = this;
+            var _this15 = this;
 
             this.__backendValidationErrors = {};
             this.__activeCurrentRelations.forEach(function (currentRel) {
-                _this16[currentRel].clearValidationErrors();
+                _this15[currentRel].clearValidationErrors();
             });
         }
 
@@ -1827,12 +1857,12 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
     }, {
         key: 'delete',
         value: function _delete() {
-            var _this17 = this;
+            var _this16 = this;
 
             var options = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
 
             var removeFromStore = function removeFromStore() {
-                return _this17.__store ? _this17.__store.remove(_this17) : null;
+                return _this16.__store ? _this16.__store.remove(_this16) : null;
             };
             if (options.immediate || this.isNew) {
                 removeFromStore();
@@ -1858,7 +1888,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
     }, {
         key: 'fetch',
         value: function fetch() {
-            var _this18 = this;
+            var _this17 = this;
 
             var options = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
 
@@ -1874,7 +1904,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
                 data: data,
                 requestOptions: omit(options, ['data', 'url'])
             }).then(action(function (res) {
-                _this18.fromBackend(res);
+                _this17.fromBackend(res);
             })).catch(function (e) {
                 if (Axios.isCancel(e)) {
                     return null;
@@ -1888,14 +1918,15 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
     }, {
         key: 'clear',
         value: function clear() {
-            var _this19 = this;
+            var _this18 = this;
 
-            forIn(this.__originalAttributes, function (value, key) {
-                _this19[key] = value;
-            });
+            // Use native for...in for better performance
+            for (var key in this.__originalAttributes) {
+                this[key] = this.__originalAttributes[key];
+            }
 
             this.__activeCurrentRelations.forEach(function (currentRel) {
-                _this19[currentRel].clear();
+                _this18[currentRel].clear();
             });
         }
 
@@ -1919,11 +1950,11 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
     }, {
         key: 'dispose',
         value: function dispose() {
-            var _this20 = this;
+            var _this19 = this;
 
             // Revoke all blob URLs
             Object.keys(this.__blobUrls).forEach(function (name) {
-                URL.revokeObjectURL(_this20.__blobUrls[name]);
+                URL.revokeObjectURL(_this19.__blobUrls[name]);
             });
             this.__blobUrls = {};
 
@@ -1942,25 +1973,25 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
             this.__backendValidationErrors = {};
 
             // Clear changes tracking
-            this.__changes = [];
+            this.__changes.clear();
 
             // Dispose relations if they have dispose method
             this.__activeCurrentRelations.forEach(function (rel) {
-                if (_this20[rel] && typeof _this20[rel].dispose === 'function') {
-                    _this20[rel].dispose();
+                if (_this19[rel] && typeof _this19[rel].dispose === 'function') {
+                    _this19[rel].dispose();
                 }
             });
         }
     }, {
         key: 'hasUserChanges',
         get: function get() {
-            var _this21 = this;
+            var _this20 = this;
 
-            if (this.__changes.length > 0) {
+            if (this.__changes.size > 0) {
                 return true;
             }
             return this.__activeCurrentRelations.some(function (rel) {
-                return _this21[rel].hasUserChanges;
+                return _this20[rel].hasUserChanges;
             });
         }
     }, {
@@ -1968,10 +1999,16 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
         get: function get() {
             var pickFields = this.pickFields();
             var omitFields = this.omitFields();
+            var cacheKey = (pickFields ? pickFields.join(',') : '') + '_' + omitFields.join(',');
 
-            return function (name) {
-                return (!pickFields || pickFields.includes(name)) && !omitFields.includes(name);
-            };
+            if (!this.__fieldFilterCache || this.__fieldFilterCacheKey !== cacheKey) {
+                this.__fieldFilterCacheKey = cacheKey;
+                this.__fieldFilterCache = function (name) {
+                    return (!pickFields || pickFields.includes(name)) && !omitFields.includes(name);
+                };
+            }
+
+            return this.__fieldFilterCache;
         }
     }, {
         key: 'backendValidationErrors',
@@ -2023,7 +2060,7 @@ var Model = (_dec$1 = observable.shallow, _dec2$1 = observable.shallow, _dec3 = 
     initializer: function initializer() {
         return {};
     }
-}), _applyDecoratedDescriptor$1(_class$1.prototype, 'url', [computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'url'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'isNew', [computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'isNew'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'isLoading', [computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'isLoading'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, '__parseRelations', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, '__parseRelations'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'hasUserChanges', [computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'hasUserChanges'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'fromBackend', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'fromBackend'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'parse', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'parse'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'setInput', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'setInput'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, '_save', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, '_save'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, '_saveAll', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, '_saveAll'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'parseValidationErrors', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'parseValidationErrors'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'clearValidationErrors', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'clearValidationErrors'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'delete', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'delete'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'fetch', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'fetch'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'clear', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'clear'), _class$1.prototype)), _class$1));
+}), _applyDecoratedDescriptor$1(_class$1.prototype, 'url', [computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'url'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'isNew', [computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'isNew'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'isLoading', [computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'isLoading'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, '__parseRelations', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, '__parseRelations'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'hasUserChanges', [computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'hasUserChanges'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'fromBackend', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'fromBackend'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'parse', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'parse'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'saveFile', [_dec6], Object.getOwnPropertyDescriptor(_class$1.prototype, 'saveFile'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'setInput', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'setInput'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, '_save', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, '_save'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, '_saveAll', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, '_saveAll'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'parseValidationErrors', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'parseValidationErrors'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'clearValidationErrors', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'clearValidationErrors'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'delete', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'delete'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'fetch', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'fetch'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'clear', [action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'clear'), _class$1.prototype)), _class$1));
 
 // Function ripped from Django docs.
 // See: https://docs.djangoproject.com/en/dev/ref/csrf/#ajax
@@ -2237,7 +2274,7 @@ var BinderApi = function () {
             return {
                 // TODO: I really dislike that this is comma separated and not an array.
                 // We should fix this in the Binder API.
-                with: model.__activeRelations.map(model.constructor.toBackendAttrKey).join(',') || null
+                with: model.__activeRelations && model.__activeRelations.length > 0 ? model.__activeRelations.map(model.constructor.toBackendAttrKey).join(',') : null
             };
         }
     }, {
@@ -2316,7 +2353,7 @@ var BinderApi = function () {
             var offset = store.getPageOffset();
             var limit = store.__limit;
             return {
-                with: store.__activeRelations.map(store.Model.toBackendAttrKey).join(',') || null,
+                with: store.__activeRelations && store.__activeRelations.length > 0 ? store.__activeRelations.map(store.Model.toBackendAttrKey).join(',') : null,
                 limit: limit === null ? 'none' : limit,
                 // Hide offset if zero so the request looks cleaner in DevTools.
                 offset: offset || null
