@@ -238,7 +238,7 @@ export default class BinderApi {
 
     buildFetchStoreParams(store) {
         const offset = store.getPageOffset();
-        const limit = store.__state.limit;
+        const limit = store.__limit;
         return {
             with:
                 store.__activeRelations

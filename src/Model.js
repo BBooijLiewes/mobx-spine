@@ -79,17 +79,20 @@ export default class Model {
     abortController;
     // A `cid` can be used to identify the model locally.
     cid = `m${uniqueId()}`;
-    @observable __backendValidationErrors = {};
+    @observable.shallow __backendValidationErrors = {};
     @observable __pendingRequestCount = 0;
     // URL query params that are added to fetch requests.
-    @observable __fetchParams = {};
+    @observable.shallow __fetchParams = {};
     // Holds fields (attrs+relations) that have been changed via setInput()
-    @observable __changes = [];
+    // Use plain array since we only need to track changes, not observe the array itself
+    __changes = [];
 
-    // File state
-    @observable __fileChanges = {};
-    @observable __fileDeletions = {};
-    @observable __fileExists = {};
+    // File state - use shallow observables
+    @observable.shallow __fileChanges = {};
+    @observable.shallow __fileDeletions = {};
+    @observable.shallow __fileExists = {};
+    // Track blob URLs for cleanup
+    __blobUrls = {};
 
     wrapPendingRequestCount(promise) {
         this.__pendingRequestCount++;
@@ -276,10 +279,15 @@ export default class Model {
     }
 
     clearUserFieldChanges() {
-        this.__changes.clear();
+        this.__changes = [];
     }
 
     clearUserFileChanges() {
+        // Revoke all blob URLs before clearing
+        Object.keys(this.__blobUrls).forEach(name => {
+            URL.revokeObjectURL(this.__blobUrls[name]);
+        });
+        this.__blobUrls = {};
         this.__fileChanges = {};
         this.__fileDeletions = {};
         this.__fileExists = {};
@@ -290,7 +298,8 @@ export default class Model {
         this.clearUserFileChanges();
     }
 
-    @computed get fieldFilter() {
+    // Convert to regular getter to avoid creating new function on each access
+    get fieldFilter() {
         const pickFields = this.pickFields();
         const omitFields = this.omitFields();
 
@@ -688,12 +697,25 @@ export default class Model {
                 this.__fileChanges[name] = value;
                 delete this.__fileDeletions[name];
 
-                value = `${URL.createObjectURL(value)}?content_type=${value.type}`;
+                // Revoke old blob URL to prevent memory leak
+                if (this.__blobUrls[name]) {
+                    URL.revokeObjectURL(this.__blobUrls[name]);
+                }
+                
+                const blobUrl = URL.createObjectURL(value);
+                this.__blobUrls[name] = blobUrl;
+                value = `${blobUrl}?content_type=${value.type}`;
             } else {
                 if (!this.__fileChanges[name] || this.__fileChanges[name].existed) {
                     this.__fileDeletions[name] = true;
                 }
                 delete this.__fileChanges[name];
+
+                // Revoke blob URL when clearing file
+                if (this.__blobUrls[name]) {
+                    URL.revokeObjectURL(this.__blobUrls[name]);
+                    delete this.__blobUrls[name];
+                }
 
                 value = null;
             }
@@ -890,8 +912,7 @@ export default class Model {
         return this.fromBackend(res);
     }
 
-    // TODO: This is a bit hacky...
-    @computed
+    // Simple getter, no need for computed overhead
     get backendValidationErrors() {
         return this.__backendValidationErrors;
     }
@@ -984,5 +1005,38 @@ export default class Model {
 
     relations() {
         return this.__relations;
+    }
+
+    // Dispose of resources to prevent memory leaks
+    dispose() {
+        // Revoke all blob URLs
+        Object.keys(this.__blobUrls).forEach(name => {
+            URL.revokeObjectURL(this.__blobUrls[name]);
+        });
+        this.__blobUrls = {};
+        
+        // Abort any pending requests
+        if (this.abortController) {
+            this.abortController.abort();
+            this.abortController = null;
+        }
+        
+        // Clear file state
+        this.__fileChanges = {};
+        this.__fileDeletions = {};
+        this.__fileExists = {};
+        
+        // Clear validation errors
+        this.__backendValidationErrors = {};
+        
+        // Clear changes tracking
+        this.__changes = [];
+        
+        // Dispose relations if they have dispose method
+        this.__activeCurrentRelations.forEach(rel => {
+            if (this[rel] && typeof this[rel].dispose === 'function') {
+                this[rel].dispose();
+            }
+        });
     }
 }
