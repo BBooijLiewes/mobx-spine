@@ -23,24 +23,23 @@ const AVAILABLE_CONST_OPTIONS = [
 ];
 
 export default class Store {
-    // Holds all models
-    @observable models = [];
-    // Holds the fetch parameters
-    @observable params = {};
+    // Holds all models - use shallow observable for better performance
+    @observable.shallow models = [];
+    // Holds the fetch parameters - use shallow observable since we replace the whole object
+    @observable.shallow params = {};
     @observable __pendingRequestCount = 0;
     // The set of models has changed
     @observable __setChanged = false;
-    @observable
-    __state = {
-        currentPage: 1,
-        limit: 25,
-        totalRecords: 0,
-    };
+    // Use individual observables instead of deep observable object
+    @observable __currentPage = 1;
+    @observable __limit = 25;
+    @observable __totalRecords = 0;
     __activeRelations = [];
     Model = null;
     api = null;
     abortController;
     __repository;
+    __disposers = [];
     static backendResourceName = '';
 
     url() {
@@ -123,6 +122,7 @@ export default class Store {
             'Backend error. Data is not set. HINT: DID YOU FORGET THE M2M again?'
         );
 
+        // Use replace with shallow observable for better memory efficiency
         this.models.replace(
             data.map(record => {
                 // TODO: I'm not happy at all about how this looks.
@@ -284,7 +284,7 @@ export default class Store {
                 requestOptions: omit(options, 'data'),
             })
             .then(action(res => {
-                this.__state.totalRecords = res.totalRecords;
+                this.__totalRecords = res.totalRecords;
                 this.fromBackend(res);
 
                 return res.response;
@@ -314,7 +314,7 @@ export default class Store {
     // Methods for pagination.
 
     getPageOffset() {
-        return (this.__state.currentPage - 1) * this.__state.limit;
+        return (this.__currentPage - 1) * this.__limit;
     }
 
     @action
@@ -323,43 +323,43 @@ export default class Store {
             !limit || Number.isInteger(limit),
             'Page limit should be a number or falsy value.'
         );
-        this.__state.limit = limit || null;
+        this.__limit = limit || null;
     }
 
     @computed
     get totalPages() {
-        if (!this.__state.limit) {
+        if (!this.__limit) {
             return 0;
         }
-        return Math.ceil(this.__state.totalRecords / this.__state.limit);
+        return Math.ceil(this.__totalRecords / this.__limit);
     }
 
     @computed
     get currentPage() {
-        return this.__state.currentPage;
+        return this.__currentPage;
     }
 
     @computed
     get hasNextPage() {
-        return this.__state.currentPage + 1 <= this.totalPages;
+        return this.__currentPage + 1 <= this.totalPages;
     }
 
     @computed
     get hasPreviousPage() {
-        return this.__state.currentPage > 1;
+        return this.__currentPage > 1;
     }
 
     @action
     getNextPage() {
         invariant(this.hasNextPage, 'There is no next page.');
-        this.__state.currentPage += 1;
+        this.__currentPage += 1;
         return this.fetch();
     }
 
     @action
     getPreviousPage() {
         invariant(this.hasPreviousPage, 'There is no previous page.');
-        this.__state.currentPage -= 1;
+        this.__currentPage -= 1;
         return this.fetch();
     }
 
@@ -369,7 +369,7 @@ export default class Store {
             Number.isInteger(page) && page >= 1,
             'Page should be a number above 1.'
         );
-        this.__state.currentPage = page;
+        this.__currentPage = page;
         if (options.fetch === undefined || options.fetch) {
             return this.fetch();
         }
@@ -398,8 +398,11 @@ export default class Store {
     }
 
     toBackendAll(options = {}) {
+        // Create shared WeakSet for tracking processed models across all serialization
+        const processedModels = new WeakSet();
+        
         const relevantModels = options.onlyChanges ? this.models.filter(model => model.isNew || model.hasUserChanges) : this.models;
-        const modelData = relevantModels.map(model => model.toBackendAll(options));
+        const modelData = relevantModels.map(model => model.toBackendAll(options, processedModels));
 
         let data = [];
         const relations = {};
@@ -426,8 +429,8 @@ export default class Store {
             comparator,
         });
 
-        // Oh gawd MobX is so awesome.
-        const events = autorun(() => {
+        // Track the disposer for proper cleanup
+        const disposer = autorun(() => {
             const models = this.filter(filter);
             store.models.replace(models);
             store.sort();
@@ -437,9 +440,26 @@ export default class Store {
             store.__pendingRequestCount = this.__pendingRequestCount;
         });
 
-        store.unsubscribeVirtualStore = events;
+        // Store disposer for cleanup
+        store.__disposers.push(disposer);
+        // Keep backward compatibility
+        store.unsubscribeVirtualStore = disposer;
 
         return store;
+    }
+
+    // Dispose of all reactions and clean up resources
+    dispose() {
+        this.__disposers.forEach(disposer => disposer());
+        this.__disposers = [];
+        
+        if (this.abortController) {
+            this.abortController.abort();
+            this.abortController = null;
+        }
+        
+        // Clear models to release references
+        this.models.clear();
     }
 
     // Helper methods to read models.

@@ -18,21 +18,32 @@ function invariant(condition) {
     }
 }
 
+// Cache for attribute name conversions
+var camelToSnakeCache = new Map();
+var snakeToCamelCache = new Map();
+
 // lodash's `snakeCase` method removes dots from the string; this breaks mobx-spine
 function camelToSnake(s) {
-    return s.replace(/([A-Z])/g, function ($1) {
-        return '_' + $1.toLowerCase();
-    });
+    if (!camelToSnakeCache.has(s)) {
+        camelToSnakeCache.set(s, s.replace(/([A-Z])/g, function ($1) {
+            return '_' + $1.toLowerCase();
+        }));
+    }
+    return camelToSnakeCache.get(s);
 }
 
 // lodash's `camelCase` method removes dots from the string; this breaks mobx-spine
 function snakeToCamel(s) {
-    if (s.startsWith('_')) {
-        return s;
+    if (!snakeToCamelCache.has(s)) {
+        if (s.startsWith('_')) {
+            snakeToCamelCache.set(s, s);
+        } else {
+            snakeToCamelCache.set(s, s.replace(/_\w/g, function (m) {
+                return m[1].toUpperCase();
+            }));
+        }
     }
-    return s.replace(/_\w/g, function (m) {
-        return m[1].toUpperCase();
-    });
+    return snakeToCamelCache.get(s);
 }
 
 // ['kind.breed', 'owner'] => { 'owner': {}, 'kind': {'breed': {}}}
@@ -194,7 +205,7 @@ var slicedToArray = function () {
   };
 }();
 
-var _class, _descriptor, _descriptor2, _descriptor3, _descriptor4, _descriptor5, _class2, _temp;
+var _dec, _dec2, _class, _descriptor, _descriptor2, _descriptor3, _descriptor4, _descriptor5, _descriptor6, _descriptor7, _class2, _temp;
 
 function _initDefineProp(target, property, descriptor, context) {
     if (!descriptor) return;
@@ -237,13 +248,11 @@ function _applyDecoratedDescriptor(target, property, decorators, descriptor, con
 
 var AVAILABLE_CONST_OPTIONS = ['relations', 'limit', 'comparator', 'params', 'repository'];
 
-var Store = (_class = (_temp = _class2 = function () {
+var Store = (_dec = mobx.observable.shallow, _dec2 = mobx.observable.shallow, (_class = (_temp = _class2 = function () {
     createClass(Store, [{
         key: 'url',
 
-        // The set of models has changed
-
-        // Holds the fetch parameters
+        // Use individual observables instead of deep observable object
         value: function url() {
             // Try to auto-generate the URL.
             var bname = this.constructor.backendResourceName;
@@ -252,6 +261,10 @@ var Store = (_class = (_temp = _class2 = function () {
             }
             return null;
         }
+        // The set of models has changed
+
+        // Holds the fetch parameters - use shallow observable since we replace the whole object
+
     }, {
         key: 'initialize',
 
@@ -287,11 +300,16 @@ var Store = (_class = (_temp = _class2 = function () {
 
         _initDefineProp(this, '__setChanged', _descriptor4, this);
 
-        _initDefineProp(this, '__state', _descriptor5, this);
+        _initDefineProp(this, '__currentPage', _descriptor5, this);
+
+        _initDefineProp(this, '__limit', _descriptor6, this);
+
+        _initDefineProp(this, '__totalRecords', _descriptor7, this);
 
         this.__activeRelations = [];
         this.Model = null;
         this.api = null;
+        this.__disposers = [];
 
         invariant(lodash.isPlainObject(options), 'Store only accepts an object with options. Chain `.parse(data)` to add models.');
         lodash.forIn(options, function (value, option) {
@@ -338,6 +356,7 @@ var Store = (_class = (_temp = _class2 = function () {
 
             invariant(data, 'Backend error. Data is not set. HINT: DID YOU FORGET THE M2M again?');
 
+            // Use replace with shallow observable for better memory efficiency
             this.models.replace(data.map(function (record) {
                 // TODO: I'm not happy at all about how this looks.
                 // We'll need to finetune some things, but hey, for now it works.
@@ -496,7 +515,7 @@ var Store = (_class = (_temp = _class2 = function () {
                 data: data,
                 requestOptions: lodash.omit(options, 'data')
             }).then(mobx.action(function (res) {
-                _this5.__state.totalRecords = res.totalRecords;
+                _this5.__totalRecords = res.totalRecords;
                 _this5.fromBackend(res);
 
                 return res.response;
@@ -532,26 +551,26 @@ var Store = (_class = (_temp = _class2 = function () {
     }, {
         key: 'getPageOffset',
         value: function getPageOffset() {
-            return (this.__state.currentPage - 1) * this.__state.limit;
+            return (this.__currentPage - 1) * this.__limit;
         }
     }, {
         key: 'setLimit',
         value: function setLimit(limit) {
             invariant(!limit || Number.isInteger(limit), 'Page limit should be a number or falsy value.');
-            this.__state.limit = limit || null;
+            this.__limit = limit || null;
         }
     }, {
         key: 'getNextPage',
         value: function getNextPage() {
             invariant(this.hasNextPage, 'There is no next page.');
-            this.__state.currentPage += 1;
+            this.__currentPage += 1;
             return this.fetch();
         }
     }, {
         key: 'getPreviousPage',
         value: function getPreviousPage() {
             invariant(this.hasPreviousPage, 'There is no previous page.');
-            this.__state.currentPage -= 1;
+            this.__currentPage -= 1;
             return this.fetch();
         }
     }, {
@@ -561,7 +580,7 @@ var Store = (_class = (_temp = _class2 = function () {
             var options = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
 
             invariant(Number.isInteger(page) && page >= 1, 'Page should be a number above 1.');
-            this.__state.currentPage = page;
+            this.__currentPage = page;
             if (options.fetch === undefined || options.fetch) {
                 return this.fetch();
             }
@@ -582,11 +601,14 @@ var Store = (_class = (_temp = _class2 = function () {
 
             var options = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
 
+            // Create shared WeakSet for tracking processed models across all serialization
+            var processedModels = new WeakSet();
+
             var relevantModels = options.onlyChanges ? this.models.filter(function (model) {
                 return model.isNew || model.hasUserChanges;
             }) : this.models;
             var modelData = relevantModels.map(function (model) {
-                return model.toBackendAll(options);
+                return model.toBackendAll(options, processedModels);
             });
 
             var data = [];
@@ -620,8 +642,8 @@ var Store = (_class = (_temp = _class2 = function () {
                 comparator: comparator
             });
 
-            // Oh gawd MobX is so awesome.
-            var events = mobx.autorun(function () {
+            // Track the disposer for proper cleanup
+            var disposer = mobx.autorun(function () {
                 var models = _this7.filter(filter);
                 store.models.replace(models);
                 store.sort();
@@ -631,9 +653,31 @@ var Store = (_class = (_temp = _class2 = function () {
                 store.__pendingRequestCount = _this7.__pendingRequestCount;
             });
 
-            store.unsubscribeVirtualStore = events;
+            // Store disposer for cleanup
+            store.__disposers.push(disposer);
+            // Keep backward compatibility
+            store.unsubscribeVirtualStore = disposer;
 
             return store;
+        }
+
+        // Dispose of all reactions and clean up resources
+
+    }, {
+        key: 'dispose',
+        value: function dispose() {
+            this.__disposers.forEach(function (disposer) {
+                return disposer();
+            });
+            this.__disposers = [];
+
+            if (this.abortController) {
+                this.abortController.abort();
+                this.abortController = null;
+            }
+
+            // Clear models to release references
+            this.models.clear();
         }
 
         // Helper methods to read models.
@@ -751,25 +795,25 @@ var Store = (_class = (_temp = _class2 = function () {
     }, {
         key: 'totalPages',
         get: function get() {
-            if (!this.__state.limit) {
+            if (!this.__limit) {
                 return 0;
             }
-            return Math.ceil(this.__state.totalRecords / this.__state.limit);
+            return Math.ceil(this.__totalRecords / this.__limit);
         }
     }, {
         key: 'currentPage',
         get: function get() {
-            return this.__state.currentPage;
+            return this.__currentPage;
         }
     }, {
         key: 'hasNextPage',
         get: function get() {
-            return this.__state.currentPage + 1 <= this.totalPages;
+            return this.__currentPage + 1 <= this.totalPages;
         }
     }, {
         key: 'hasPreviousPage',
         get: function get() {
-            return this.__state.currentPage > 1;
+            return this.__currentPage > 1;
         }
     }, {
         key: 'hasUserChanges',
@@ -789,12 +833,12 @@ var Store = (_class = (_temp = _class2 = function () {
         }
     }]);
     return Store;
-}(), _class2.backendResourceName = '', _temp), (_descriptor = _applyDecoratedDescriptor(_class.prototype, 'models', [mobx.observable], {
+}(), _class2.backendResourceName = '', _temp), (_descriptor = _applyDecoratedDescriptor(_class.prototype, 'models', [_dec], {
     enumerable: true,
     initializer: function initializer() {
         return [];
     }
-}), _descriptor2 = _applyDecoratedDescriptor(_class.prototype, 'params', [mobx.observable], {
+}), _descriptor2 = _applyDecoratedDescriptor(_class.prototype, 'params', [_dec2], {
     enumerable: true,
     initializer: function initializer() {
         return {};
@@ -809,16 +853,22 @@ var Store = (_class = (_temp = _class2 = function () {
     initializer: function initializer() {
         return false;
     }
-}), _descriptor5 = _applyDecoratedDescriptor(_class.prototype, '__state', [mobx.observable], {
+}), _descriptor5 = _applyDecoratedDescriptor(_class.prototype, '__currentPage', [mobx.observable], {
     enumerable: true,
     initializer: function initializer() {
-        return {
-            currentPage: 1,
-            limit: 25,
-            totalRecords: 0
-        };
+        return 1;
     }
-}), _applyDecoratedDescriptor(_class.prototype, 'isLoading', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'isLoading'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'length', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'length'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'fromBackend', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'fromBackend'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'sort', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'sort'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'parse', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'parse'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'add', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'add'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'remove', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'remove'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'removeById', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'removeById'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'clear', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'clear'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'fetch', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'fetch'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'setLimit', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'setLimit'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'totalPages', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'totalPages'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'currentPage', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'currentPage'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'hasNextPage', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'hasNextPage'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'hasPreviousPage', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'hasPreviousPage'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'getNextPage', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'getNextPage'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'getPreviousPage', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'getPreviousPage'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'setPage', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'setPage'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'hasUserChanges', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'hasUserChanges'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'hasSetChanges', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'hasSetChanges'), _class.prototype)), _class);
+}), _descriptor6 = _applyDecoratedDescriptor(_class.prototype, '__limit', [mobx.observable], {
+    enumerable: true,
+    initializer: function initializer() {
+        return 25;
+    }
+}), _descriptor7 = _applyDecoratedDescriptor(_class.prototype, '__totalRecords', [mobx.observable], {
+    enumerable: true,
+    initializer: function initializer() {
+        return 0;
+    }
+}), _applyDecoratedDescriptor(_class.prototype, 'isLoading', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'isLoading'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'length', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'length'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'fromBackend', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'fromBackend'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'sort', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'sort'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'parse', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'parse'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'add', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'add'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'remove', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'remove'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'removeById', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'removeById'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'clear', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'clear'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'fetch', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'fetch'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'setLimit', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'setLimit'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'totalPages', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'totalPages'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'currentPage', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'currentPage'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'hasNextPage', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'hasNextPage'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'hasPreviousPage', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'hasPreviousPage'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'getNextPage', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'getNextPage'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'getPreviousPage', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'getPreviousPage'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'setPage', [mobx.action], Object.getOwnPropertyDescriptor(_class.prototype, 'setPage'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'hasUserChanges', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'hasUserChanges'), _class.prototype), _applyDecoratedDescriptor(_class.prototype, 'hasSetChanges', [mobx.computed], Object.getOwnPropertyDescriptor(_class.prototype, 'hasSetChanges'), _class.prototype)), _class));
 
 var Relation = function () {
     function Relation(toModel) {
@@ -837,7 +887,7 @@ var Relation = function () {
     return Relation;
 }();
 
-var _class$1, _descriptor$1, _descriptor2$1, _descriptor3$1, _descriptor4$1, _descriptor5$1, _descriptor6, _descriptor7, _class2$1, _temp$1;
+var _dec$1, _dec2$1, _dec3, _dec4, _dec5, _dec6, _class$1, _descriptor$1, _descriptor2$1, _descriptor3$1, _descriptor4$1, _descriptor5$1, _descriptor6$1, _class2$1, _temp$1;
 
 function _initDefineProp$1(target, property, descriptor, context) {
     if (!descriptor) return;
@@ -889,7 +939,7 @@ var RE_SPLIT_FIRST_RELATION = /([^.]+)\.(.+)/;
 // TODO: find a way to get a list of existing properties automatically.
 var FORBIDDEN_ATTRS = ['url', 'urlRoot', 'api', 'isNew', 'isLoading', 'parse', 'save', 'clear'];
 
-var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
+var Model = (_dec$1 = mobx.observable.shallow, _dec2$1 = mobx.observable.shallow, _dec3 = mobx.observable.shallow, _dec4 = mobx.observable.shallow, _dec5 = mobx.observable.shallow, _dec6 = mobx.action.bound, (_class$1 = (_temp$1 = _class2$1 = function () {
     createClass(Model, [{
         key: 'urlRoot',
 
@@ -913,9 +963,12 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
         // URL query params that are added to fetch requests.
 
         // Holds fields (attrs+relations) that have been changed via setInput()
+        // Use Set for O(1) lookups instead of O(n) array.includes()
 
 
-        // File state
+        // File state - use shallow observables
+
+        // Track blob URLs for cleanup
 
     }, {
         key: 'wrapPendingRequestCount',
@@ -1020,19 +1073,28 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
 
         _initDefineProp$1(this, '__fetchParams', _descriptor3$1, this);
 
-        _initDefineProp$1(this, '__changes', _descriptor4$1, this);
+        this.__changes = new Set();
 
-        _initDefineProp$1(this, '__fileChanges', _descriptor5$1, this);
+        _initDefineProp$1(this, '__fileChanges', _descriptor4$1, this);
 
-        _initDefineProp$1(this, '__fileDeletions', _descriptor6, this);
+        _initDefineProp$1(this, '__fileDeletions', _descriptor5$1, this);
 
-        _initDefineProp$1(this, '__fileExists', _descriptor7, this);
+        _initDefineProp$1(this, '__fileExists', _descriptor6$1, this);
 
+        this.__blobUrls = {};
         this.__relations = {};
 
         this.__store = options.store;
         this.__repository = options.repository;
         this.abortController = new AbortController();
+
+        // Cache casts() result to avoid repeated method calls
+        this.__castsCache = this.casts();
+        // Cache fileFields() result
+        this.__fileFieldsCache = this.fileFields();
+        // Initialize fieldFilter cache
+        this.__fieldFilterCache = null;
+        this.__fieldFilterCacheKey = null;
 
         // Find all attributes. Not all observables are an attribute.
         lodash.forIn(this, function (value, key) {
@@ -1062,8 +1124,6 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
             this.parse(data);
         }
         this.initialize();
-
-        this.saveFile = this.saveFile.bind(this);
     }
 
     createClass(Model, [{
@@ -1117,6 +1177,13 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
     }, {
         key: 'clearUserFileChanges',
         value: function clearUserFileChanges() {
+            var _this4 = this;
+
+            // Revoke all blob URLs before clearing
+            Object.keys(this.__blobUrls).forEach(function (name) {
+                URL.revokeObjectURL(_this4.__blobUrls[name]);
+            });
+            this.__blobUrls = {};
             this.__fileChanges = {};
             this.__fileDeletions = {};
             this.__fileExists = {};
@@ -1127,10 +1194,13 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
             this.clearUserFieldChanges();
             this.clearUserFileChanges();
         }
+
+        // Cache fieldFilter function to avoid recreating it
+
     }, {
         key: 'toBackend',
         value: function toBackend() {
-            var _this4 = this;
+            var _this5 = this;
 
             var _ref = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
 
@@ -1145,25 +1215,25 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
             var output = {};
             // By default we'll include all fields (attributes+relations), but sometimes you might want to specify the fields to be included.
             var fieldFilter = function fieldFilter(field) {
-                if (!_this4.fieldFilter(field)) {
+                if (!_this5.fieldFilter(field)) {
                     return false;
                 }
                 if (options.fields) {
                     return options.fields.includes(field);
                 }
-                if (!_this4.isNew && options.onlyChanges) {
+                if (!_this5.isNew && options.onlyChanges) {
                     var forceFields = options.forceFields || [];
-                    return forceFields.includes(field) || _this4.__changes.includes(field) || _this4[field] instanceof Store && _this4[field].hasSetChanges ||
+                    return forceFields.includes(field) || _this5.__changes.has(field) || _this5[field] instanceof Store && _this5[field].hasSetChanges ||
                     // isNew is always true for relations that haven't been saved.
                     // If no property has been tweaked, its id serializes as null.
                     // So, we need to skip saving the id if new and no changes.
-                    _this4[field] instanceof Model && _this4[field].isNew && _this4[field].hasUserChanges;
+                    _this5[field] instanceof Model && _this5[field].isNew && _this5[field].hasUserChanges;
                 }
                 return true;
             };
             this.__attributes.filter(fieldFilter).forEach(function (attr) {
                 if (!attr.startsWith('_')) {
-                    output[_this4.constructor.toBackendAttrKey(attr)] = _this4.__toJSAttr(attr, _this4[attr]);
+                    output[_this5.constructor.toBackendAttrKey(attr)] = _this5.__toJSAttr(attr, _this5[attr]);
                 }
             });
 
@@ -1172,8 +1242,8 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
 
             // Add active relations as id.
             this.__activeCurrentRelations.filter(fieldFilter).forEach(function (currentRel) {
-                var rel = _this4[currentRel];
-                var relBackendName = _this4.constructor.toBackendAttrKey(currentRel);
+                var rel = _this5[currentRel];
+                var relBackendName = _this5.constructor.toBackendAttrKey(currentRel);
                 if (rel instanceof Model) {
                     output[relBackendName] = rel[rel.constructor.primaryKey];
                 }
@@ -1188,9 +1258,23 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
     }, {
         key: 'toBackendAll',
         value: function toBackendAll() {
-            var _this5 = this;
+            var _this6 = this;
 
             var options = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
+
+            var _processedModels = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : null;
+
+            // Track processed models to avoid duplicate serialization
+            var isRootCall = _processedModels === null;
+            if (isRootCall) {
+                _processedModels = new WeakSet();
+            }
+
+            // Skip if already processed
+            if (_processedModels.has(this)) {
+                return { data: [], relations: {} };
+            }
+            _processedModels.add(this);
 
             var nestedRelations = options.nestedRelations || {};
             var data = this.toBackend({
@@ -1206,8 +1290,8 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
             var relations = {};
 
             this.__activeCurrentRelations.forEach(function (currentRel) {
-                var rel = _this5[currentRel];
-                var relBackendName = _this5.constructor.toBackendAttrKey(currentRel);
+                var rel = _this6[currentRel];
+                var relBackendName = _this6.constructor.toBackendAttrKey(currentRel);
                 var subRelations = nestedRelations[currentRel];
 
                 if (subRelations !== undefined) {
@@ -1224,7 +1308,7 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
                     var relBackendData = rel.toBackendAll({
                         nestedRelations: subRelations,
                         onlyChanges: options.onlyChanges
-                    });
+                    }, _processedModels);
 
                     // Sometimes the backend knows the relation by a different name, e.g. the relation is called
                     // `activities`, but the name in the backend is `activity`.
@@ -1253,15 +1337,15 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
     }, {
         key: 'toJS',
         value: function toJS() {
-            var _this6 = this;
+            var _this7 = this;
 
             var output = {};
             this.__attributes.forEach(function (attr) {
-                output[attr] = _this6.__toJSAttr(attr, _this6[attr]);
+                output[attr] = _this7.__toJSAttr(attr, _this7[attr]);
             });
 
             this.__activeCurrentRelations.forEach(function (currentRel) {
-                var model = _this6[currentRel];
+                var model = _this7[currentRel];
                 if (model) {
                     output[currentRel] = model.toJS();
                 }
@@ -1271,8 +1355,7 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
     }, {
         key: '__toJSAttr',
         value: function __toJSAttr(attr, value) {
-            var casts = this.casts();
-            var cast = casts[attr];
+            var cast = this.__castsCache[attr];
             if (cast !== undefined) {
                 return mobx.toJS(cast.toJS(attr, value));
             }
@@ -1324,7 +1407,7 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
     }, {
         key: '__scopeBackendResponse',
         value: function __scopeBackendResponse(_ref3) {
-            var _this7 = this;
+            var _this8 = this;
 
             var data = _ref3.data,
                 targetRelName = _ref3.targetRelName,
@@ -1346,18 +1429,18 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
                 var repository = repos[repoName];
                 // For backwards compatibility, reverseMapping is optional (for now)
                 var reverseRelName = reverseMapping ? reverseMapping[backendRelName] : null;
-                var relName = _this7.constructor.fromBackendAttrKey(backendRelName);
+                var relName = _this8.constructor.fromBackendAttrKey(backendRelName);
 
                 if (targetRelName === relName) {
-                    var relKey = data[_this7.constructor.toBackendAttrKey(relName)];
+                    var relKey = data[_this8.constructor.toBackendAttrKey(relName)];
                     if (relKey !== undefined) {
                         relevant = true;
-                        scopedData = _this7.__parseRepositoryToData(relKey, repository);
+                        scopedData = _this8.__parseRepositoryToData(relKey, repository);
                     } else if (repository && reverseRelName) {
-                        var pk = data[_this7.constructor.primaryKey];
+                        var pk = data[_this8.constructor.primaryKey];
                         relevant = true;
-                        scopedData = _this7.__parseReverseRepositoryToData(reverseRelName, pk, repository);
-                        if (_this7.relations(relName).prototype instanceof Model) {
+                        scopedData = _this8.__parseReverseRepositoryToData(reverseRelName, pk, repository);
+                        if (_this8.relations(relName).prototype instanceof Model) {
                             if (scopedData.length === 0) {
                                 scopedData = null;
                             } else if (scopedData.length === 1) {
@@ -1397,7 +1480,7 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
     }, {
         key: 'fromBackend',
         value: function fromBackend(_ref4) {
-            var _this8 = this;
+            var _this9 = this;
 
             var data = _ref4.data,
                 repos = _ref4.repos,
@@ -1410,8 +1493,8 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
             // So when we have a model with a `town.restaurants.chef` relation,
             // we call fromBackend on the `town` relation.
             lodash.each(this.__activeCurrentRelations, function (relName) {
-                var rel = _this8[relName];
-                var resScoped = _this8.__scopeBackendResponse({
+                var rel = _this9[relName];
+                var resScoped = _this9.__scopeBackendResponse({
                     data: data,
                     targetRelName: relName,
                     repos: repos,
@@ -1453,33 +1536,32 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
     }, {
         key: 'parse',
         value: function parse(data) {
-            var _this9 = this;
-
             invariant(lodash.isPlainObject(data), 'Parameter supplied to `parse()` is not an object, got: ' + JSON.stringify(data));
 
-            lodash.forIn(data, function (value, key) {
-                var attr = _this9.constructor.fromBackendAttrKey(key);
-                if (_this9.__attributes.includes(attr)) {
-                    _this9[attr] = _this9.__parseAttr(attr, value);
-                } else if (_this9.__activeCurrentRelations.includes(attr)) {
+            // Use native for...in for better performance than lodash forIn
+            for (var key in data) {
+                var value = data[key];
+                var attr = this.constructor.fromBackendAttrKey(key);
+                if (this.__attributes.includes(attr)) {
+                    this[attr] = this.__parseAttr(attr, value);
+                } else if (this.__activeCurrentRelations.includes(attr)) {
                     // In Binder, a relation property is an `int` or `[int]`, referring to its ID.
                     // However, it can also be an object if there are nested relations (non flattened).
                     if (lodash.isPlainObject(value) || Array.isArray(value) && value.every(lodash.isPlainObject)) {
-                        _this9[attr].parse(value);
+                        this[attr].parse(value);
                     } else if (value === null) {
                         // The relation is cleared.
-                        _this9[attr].clear();
+                        this[attr].clear();
                     }
                 }
-            });
+            }
 
             return this;
         }
     }, {
         key: '__parseAttr',
         value: function __parseAttr(attr, value) {
-            var casts = this.casts();
-            var cast = casts[attr];
+            var cast = this.__castsCache[attr];
             if (cast !== undefined) {
                 return cast.parse(attr, value);
             }
@@ -1520,13 +1602,13 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
     }, {
         key: 'saveFiles',
         value: function saveFiles() {
-            return Promise.all(this.fileFields().filter(this.fieldFilter).map(this.saveFile));
+            return Promise.all(this.__fileFieldsCache.filter(this.fieldFilter).map(this.saveFile));
         }
     }, {
         key: 'setInput',
         value: function setInput(name, value) {
             invariant(this.__attributes.includes(name) || this.__activeCurrentRelations.includes(name), 'Field `' + name + '` does not exist on the model.');
-            if (this.fileFields().includes(name)) {
+            if (this.__fileFieldsCache.includes(name)) {
                 if (this.__fileExists[name] === undefined) {
                     this.__fileExists[name] = this[name] !== null;
                 }
@@ -1534,19 +1616,30 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
                     this.__fileChanges[name] = value;
                     delete this.__fileDeletions[name];
 
-                    value = URL.createObjectURL(value) + '?content_type=' + value.type;
+                    // Revoke old blob URL to prevent memory leak
+                    if (this.__blobUrls[name]) {
+                        URL.revokeObjectURL(this.__blobUrls[name]);
+                    }
+
+                    var blobUrl = URL.createObjectURL(value);
+                    this.__blobUrls[name] = blobUrl;
+                    value = blobUrl + '?content_type=' + value.type;
                 } else {
                     if (!this.__fileChanges[name] || this.__fileChanges[name].existed) {
                         this.__fileDeletions[name] = true;
                     }
                     delete this.__fileChanges[name];
 
+                    // Revoke blob URL when clearing file
+                    if (this.__blobUrls[name]) {
+                        URL.revokeObjectURL(this.__blobUrls[name]);
+                        delete this.__blobUrls[name];
+                    }
+
                     value = null;
                 }
             }
-            if (!this.__changes.includes(name)) {
-                this.__changes.push(name);
-            }
+            this.__changes.add(name);
             if (this.__activeCurrentRelations.includes(name)) {
                 if (lodash.isArray(value)) {
                     this[name].clear();
@@ -1629,7 +1722,7 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
                 requestOptions: lodash.omit(options, 'url', 'data', 'mapData')
             }).then(mobx.action(function (res) {
                 _this11.saveFromBackend(_extends({}, res, {
-                    data: lodash.omit(res.data, _this11.fileFields().map(camelToSnake))
+                    data: lodash.omit(res.data, _this11.__fileFieldsCache.map(camelToSnake))
                 }));
                 _this11.clearUserFieldChanges();
                 return _this11.saveFiles().then(function () {
@@ -1765,7 +1858,7 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
             return this.fromBackend(res);
         }
 
-        // TODO: This is a bit hacky...
+        // Simple getter, no need for computed overhead
 
     }, {
         key: 'delete',
@@ -1833,9 +1926,10 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
         value: function clear() {
             var _this18 = this;
 
-            lodash.forIn(this.__originalAttributes, function (value, key) {
-                _this18[key] = value;
-            });
+            // Use native for...in for better performance
+            for (var key in this.__originalAttributes) {
+                this[key] = this.__originalAttributes[key];
+            }
 
             this.__activeCurrentRelations.forEach(function (currentRel) {
                 _this18[currentRel].clear();
@@ -1856,16 +1950,54 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
         value: function relations() {
             return this.__relations;
         }
+
+        // Dispose of resources to prevent memory leaks
+
+    }, {
+        key: 'dispose',
+        value: function dispose() {
+            var _this19 = this;
+
+            // Revoke all blob URLs
+            Object.keys(this.__blobUrls).forEach(function (name) {
+                URL.revokeObjectURL(_this19.__blobUrls[name]);
+            });
+            this.__blobUrls = {};
+
+            // Abort any pending requests
+            if (this.abortController) {
+                this.abortController.abort();
+                this.abortController = null;
+            }
+
+            // Clear file state
+            this.__fileChanges = {};
+            this.__fileDeletions = {};
+            this.__fileExists = {};
+
+            // Clear validation errors
+            this.__backendValidationErrors = {};
+
+            // Clear changes tracking
+            this.__changes.clear();
+
+            // Dispose relations if they have dispose method
+            this.__activeCurrentRelations.forEach(function (rel) {
+                if (_this19[rel] && typeof _this19[rel].dispose === 'function') {
+                    _this19[rel].dispose();
+                }
+            });
+        }
     }, {
         key: 'hasUserChanges',
         get: function get() {
-            var _this19 = this;
+            var _this20 = this;
 
-            if (this.__changes.length > 0) {
+            if (this.__changes.size > 0) {
                 return true;
             }
             return this.__activeCurrentRelations.some(function (rel) {
-                return _this19[rel].hasUserChanges;
+                return _this20[rel].hasUserChanges;
             });
         }
     }, {
@@ -1873,10 +2005,16 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
         get: function get() {
             var pickFields = this.pickFields();
             var omitFields = this.omitFields();
+            var cacheKey = (pickFields ? pickFields.join(',') : '') + '_' + omitFields.join(',');
 
-            return function (name) {
-                return (!pickFields || pickFields.includes(name)) && !omitFields.includes(name);
-            };
+            if (!this.__fieldFilterCache || this.__fieldFilterCacheKey !== cacheKey) {
+                this.__fieldFilterCacheKey = cacheKey;
+                this.__fieldFilterCache = function (name) {
+                    return (!pickFields || pickFields.includes(name)) && !omitFields.includes(name);
+                };
+            }
+
+            return this.__fieldFilterCache;
         }
     }, {
         key: 'backendValidationErrors',
@@ -1898,7 +2036,7 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
         }
     }]);
     return Model;
-}(), _class2$1.primaryKey = 'id', _class2$1.backendResourceName = '', _class2$1.fileFields = [], _class2$1.pickFields = undefined, _class2$1.omitFields = [], _temp$1), (_descriptor$1 = _applyDecoratedDescriptor$1(_class$1.prototype, '__backendValidationErrors', [mobx.observable], {
+}(), _class2$1.primaryKey = 'id', _class2$1.backendResourceName = '', _class2$1.fileFields = [], _class2$1.pickFields = undefined, _class2$1.omitFields = [], _temp$1), (_descriptor$1 = _applyDecoratedDescriptor$1(_class$1.prototype, '__backendValidationErrors', [_dec$1], {
     enumerable: true,
     initializer: function initializer() {
         return {};
@@ -1908,32 +2046,27 @@ var Model = (_class$1 = (_temp$1 = _class2$1 = function () {
     initializer: function initializer() {
         return 0;
     }
-}), _descriptor3$1 = _applyDecoratedDescriptor$1(_class$1.prototype, '__fetchParams', [mobx.observable], {
+}), _descriptor3$1 = _applyDecoratedDescriptor$1(_class$1.prototype, '__fetchParams', [_dec2$1], {
     enumerable: true,
     initializer: function initializer() {
         return {};
     }
-}), _descriptor4$1 = _applyDecoratedDescriptor$1(_class$1.prototype, '__changes', [mobx.observable], {
-    enumerable: true,
-    initializer: function initializer() {
-        return [];
-    }
-}), _descriptor5$1 = _applyDecoratedDescriptor$1(_class$1.prototype, '__fileChanges', [mobx.observable], {
+}), _descriptor4$1 = _applyDecoratedDescriptor$1(_class$1.prototype, '__fileChanges', [_dec3], {
     enumerable: true,
     initializer: function initializer() {
         return {};
     }
-}), _descriptor6 = _applyDecoratedDescriptor$1(_class$1.prototype, '__fileDeletions', [mobx.observable], {
+}), _descriptor5$1 = _applyDecoratedDescriptor$1(_class$1.prototype, '__fileDeletions', [_dec4], {
     enumerable: true,
     initializer: function initializer() {
         return {};
     }
-}), _descriptor7 = _applyDecoratedDescriptor$1(_class$1.prototype, '__fileExists', [mobx.observable], {
+}), _descriptor6$1 = _applyDecoratedDescriptor$1(_class$1.prototype, '__fileExists', [_dec5], {
     enumerable: true,
     initializer: function initializer() {
         return {};
     }
-}), _applyDecoratedDescriptor$1(_class$1.prototype, 'url', [mobx.computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'url'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'isNew', [mobx.computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'isNew'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'isLoading', [mobx.computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'isLoading'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, '__parseRelations', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, '__parseRelations'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'hasUserChanges', [mobx.computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'hasUserChanges'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'fieldFilter', [mobx.computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'fieldFilter'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'fromBackend', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'fromBackend'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'parse', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'parse'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'setInput', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'setInput'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, '_save', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, '_save'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, '_saveAll', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, '_saveAll'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'parseValidationErrors', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'parseValidationErrors'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'clearValidationErrors', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'clearValidationErrors'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'backendValidationErrors', [mobx.computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'backendValidationErrors'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'delete', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'delete'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'fetch', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'fetch'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'clear', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'clear'), _class$1.prototype)), _class$1);
+}), _applyDecoratedDescriptor$1(_class$1.prototype, 'url', [mobx.computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'url'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'isNew', [mobx.computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'isNew'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'isLoading', [mobx.computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'isLoading'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, '__parseRelations', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, '__parseRelations'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'hasUserChanges', [mobx.computed], Object.getOwnPropertyDescriptor(_class$1.prototype, 'hasUserChanges'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'fromBackend', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'fromBackend'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'parse', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'parse'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'saveFile', [_dec6], Object.getOwnPropertyDescriptor(_class$1.prototype, 'saveFile'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'setInput', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'setInput'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, '_save', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, '_save'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, '_saveAll', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, '_saveAll'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'parseValidationErrors', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'parseValidationErrors'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'clearValidationErrors', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'clearValidationErrors'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'delete', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'delete'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'fetch', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'fetch'), _class$1.prototype), _applyDecoratedDescriptor$1(_class$1.prototype, 'clear', [mobx.action], Object.getOwnPropertyDescriptor(_class$1.prototype, 'clear'), _class$1.prototype)), _class$1));
 
 // Function ripped from Django docs.
 // See: https://docs.djangoproject.com/en/dev/ref/csrf/#ajax
@@ -2147,7 +2280,7 @@ var BinderApi = function () {
             return {
                 // TODO: I really dislike that this is comma separated and not an array.
                 // We should fix this in the Binder API.
-                with: model.__activeRelations.map(model.constructor.toBackendAttrKey).join(',') || null
+                with: model.__activeRelations && model.__activeRelations.length > 0 ? model.__activeRelations.map(model.constructor.toBackendAttrKey).join(',') : null
             };
         }
     }, {
@@ -2224,9 +2357,9 @@ var BinderApi = function () {
         key: 'buildFetchStoreParams',
         value: function buildFetchStoreParams(store) {
             var offset = store.getPageOffset();
-            var limit = store.__state.limit;
+            var limit = store.__limit;
             return {
-                with: store.__activeRelations.map(store.Model.toBackendAttrKey).join(',') || null,
+                with: store.__activeRelations && store.__activeRelations.length > 0 ? store.__activeRelations.map(store.Model.toBackendAttrKey).join(',') : null,
                 limit: limit === null ? 'none' : limit,
                 // Hide offset if zero so the request looks cleaner in DevTools.
                 offset: offset || null

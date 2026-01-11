@@ -79,17 +79,20 @@ export default class Model {
     abortController;
     // A `cid` can be used to identify the model locally.
     cid = `m${uniqueId()}`;
-    @observable __backendValidationErrors = {};
+    @observable.shallow __backendValidationErrors = {};
     @observable __pendingRequestCount = 0;
     // URL query params that are added to fetch requests.
-    @observable __fetchParams = {};
+    @observable.shallow __fetchParams = {};
     // Holds fields (attrs+relations) that have been changed via setInput()
-    @observable __changes = [];
+    // Use Set for O(1) lookups instead of O(n) array.includes()
+    __changes = new Set();
 
-    // File state
-    @observable __fileChanges = {};
-    @observable __fileDeletions = {};
-    @observable __fileExists = {};
+    // File state - use shallow observables
+    @observable.shallow __fileChanges = {};
+    @observable.shallow __fileDeletions = {};
+    @observable.shallow __fileExists = {};
+    // Track blob URLs for cleanup
+    __blobUrls = {};
 
     wrapPendingRequestCount(promise) {
         this.__pendingRequestCount++;
@@ -170,6 +173,14 @@ export default class Model {
         this.__store = options.store;
         this.__repository = options.repository;
         this.abortController = new AbortController();
+        
+        // Cache casts() result to avoid repeated method calls
+        this.__castsCache = this.casts();
+        // Cache fileFields() result
+        this.__fileFieldsCache = this.fileFields();
+        // Initialize fieldFilter cache
+        this.__fieldFilterCache = null;
+        this.__fieldFilterCacheKey = null;
 
         // Find all attributes. Not all observables are an attribute.
         forIn(this, (value, key) => {
@@ -202,8 +213,6 @@ export default class Model {
             this.parse(data);
         }
         this.initialize();
-
-        this.saveFile = this.saveFile.bind(this);
     }
 
     @action
@@ -267,7 +276,7 @@ export default class Model {
 
     @computed
     get hasUserChanges() {
-        if (this.__changes.length > 0) {
+        if (this.__changes.size > 0) {
             return true;
         }
         return this.__activeCurrentRelations.some(rel => {
@@ -280,6 +289,11 @@ export default class Model {
     }
 
     clearUserFileChanges() {
+        // Revoke all blob URLs before clearing
+        Object.keys(this.__blobUrls).forEach(name => {
+            URL.revokeObjectURL(this.__blobUrls[name]);
+        });
+        this.__blobUrls = {};
         this.__fileChanges = {};
         this.__fileDeletions = {};
         this.__fileExists = {};
@@ -290,14 +304,21 @@ export default class Model {
         this.clearUserFileChanges();
     }
 
-    @computed get fieldFilter() {
+    // Cache fieldFilter function to avoid recreating it
+    get fieldFilter() {
         const pickFields = this.pickFields();
         const omitFields = this.omitFields();
-
-        return (name) => (
-            (!pickFields || pickFields.includes(name)) &&
-            !omitFields.includes(name)
-        );
+        const cacheKey = `${pickFields ? pickFields.join(',') : ''}_${omitFields.join(',')}`;
+        
+        if (!this.__fieldFilterCache || this.__fieldFilterCacheKey !== cacheKey) {
+            this.__fieldFilterCacheKey = cacheKey;
+            this.__fieldFilterCache = (name) => (
+                (!pickFields || pickFields.includes(name)) &&
+                !omitFields.includes(name)
+            );
+        }
+        
+        return this.__fieldFilterCache;
     }
 
     toBackend({ data = {}, mapData = (x) => x, ...options } = {}) {
@@ -314,7 +335,7 @@ export default class Model {
                 const forceFields = options.forceFields || [];
                 return (
                     forceFields.includes(field) ||
-                        this.__changes.includes(field) ||
+                        this.__changes.has(field) ||
                         (this[field] instanceof Store && this[field].hasSetChanges) ||
                         // isNew is always true for relations that haven't been saved.
                         // If no property has been tweaked, its id serializes as null.
@@ -355,7 +376,19 @@ export default class Model {
         return mapData(output);
     }
 
-    toBackendAll(options = {}) {
+    toBackendAll(options = {}, _processedModels = null) {
+        // Track processed models to avoid duplicate serialization
+        const isRootCall = _processedModels === null;
+        if (isRootCall) {
+            _processedModels = new WeakSet();
+        }
+        
+        // Skip if already processed
+        if (_processedModels.has(this)) {
+            return { data: [], relations: {} };
+        }
+        _processedModels.add(this);
+        
         const nestedRelations = options.nestedRelations || {};
         const data = this.toBackend({
             data: options.data,
@@ -389,7 +422,7 @@ export default class Model {
                 const relBackendData = rel.toBackendAll({
                     nestedRelations: subRelations,
                     onlyChanges: options.onlyChanges,
-                });
+                }, _processedModels);
 
 
                 // Sometimes the backend knows the relation by a different name, e.g. the relation is called
@@ -436,8 +469,7 @@ export default class Model {
     }
 
     __toJSAttr(attr, value) {
-        const casts = this.casts();
-        const cast = casts[attr];
+        const cast = this.__castsCache[attr];
         if (cast !== undefined) {
             return toJS(cast.toJS(attr, value));
         }
@@ -596,7 +628,9 @@ export default class Model {
             )}`
         );
 
-        forIn(data, (value, key) => {
+        // Use native for...in for better performance than lodash forIn
+        for (const key in data) {
+            const value = data[key];
             const attr = this.constructor.fromBackendAttrKey(key);
             if (this.__attributes.includes(attr)) {
                 this[attr] = this.__parseAttr(attr, value);
@@ -610,20 +644,20 @@ export default class Model {
                     this[attr].clear();
                 }
             }
-        });
+        }
 
         return this;
     }
 
     __parseAttr(attr, value) {
-        const casts = this.casts();
-        const cast = casts[attr];
+        const cast = this.__castsCache[attr];
         if (cast !== undefined) {
             return cast.parse(attr, value);
         }
         return value;
     }
 
+    @action.bound
     saveFile(name) {
         const snakeName = camelToSnake(name);
 
@@ -667,7 +701,7 @@ export default class Model {
 
     saveFiles() {
         return Promise.all(
-            this.fileFields()
+            this.__fileFieldsCache
             .filter(this.fieldFilter)
             .map(this.saveFile)
         );
@@ -680,7 +714,7 @@ export default class Model {
                 this.__activeCurrentRelations.includes(name),
             `Field \`${name}\` does not exist on the model.`
         );
-        if (this.fileFields().includes(name)) {
+        if (this.__fileFieldsCache.includes(name)) {
             if (this.__fileExists[name] === undefined) {
                 this.__fileExists[name] = this[name] !== null;
             }
@@ -688,19 +722,30 @@ export default class Model {
                 this.__fileChanges[name] = value;
                 delete this.__fileDeletions[name];
 
-                value = `${URL.createObjectURL(value)}?content_type=${value.type}`;
+                // Revoke old blob URL to prevent memory leak
+                if (this.__blobUrls[name]) {
+                    URL.revokeObjectURL(this.__blobUrls[name]);
+                }
+                
+                const blobUrl = URL.createObjectURL(value);
+                this.__blobUrls[name] = blobUrl;
+                value = `${blobUrl}?content_type=${value.type}`;
             } else {
                 if (!this.__fileChanges[name] || this.__fileChanges[name].existed) {
                     this.__fileDeletions[name] = true;
                 }
                 delete this.__fileChanges[name];
 
+                // Revoke blob URL when clearing file
+                if (this.__blobUrls[name]) {
+                    URL.revokeObjectURL(this.__blobUrls[name]);
+                    delete this.__blobUrls[name];
+                }
+
                 value = null;
             }
         }
-        if (!this.__changes.includes(name)) {
-            this.__changes.push(name);
-        }
+        this.__changes.add(name);
         if (this.__activeCurrentRelations.includes(name)) {
             if (isArray(value)) {
                 this[name].clear();
@@ -756,7 +801,7 @@ export default class Model {
             .then(action(res => {
                 this.saveFromBackend({
                     ...res,
-                    data: omit(res.data, this.fileFields().map(camelToSnake)),
+                    data: omit(res.data, this.__fileFieldsCache.map(camelToSnake)),
                 });
                 this.clearUserFieldChanges();
                 return this.saveFiles().then(() => {
@@ -890,8 +935,7 @@ export default class Model {
         return this.fromBackend(res);
     }
 
-    // TODO: This is a bit hacky...
-    @computed
+    // Simple getter, no need for computed overhead
     get backendValidationErrors() {
         return this.__backendValidationErrors;
     }
@@ -964,9 +1008,10 @@ export default class Model {
 
     @action
     clear() {
-        forIn(this.__originalAttributes, (value, key) => {
-            this[key] = value;
-        });
+        // Use native for...in for better performance
+        for (const key in this.__originalAttributes) {
+            this[key] = this.__originalAttributes[key];
+        }
 
         this.__activeCurrentRelations.forEach(currentRel => {
             this[currentRel].clear();
@@ -984,5 +1029,38 @@ export default class Model {
 
     relations() {
         return this.__relations;
+    }
+
+    // Dispose of resources to prevent memory leaks
+    dispose() {
+        // Revoke all blob URLs
+        Object.keys(this.__blobUrls).forEach(name => {
+            URL.revokeObjectURL(this.__blobUrls[name]);
+        });
+        this.__blobUrls = {};
+        
+        // Abort any pending requests
+        if (this.abortController) {
+            this.abortController.abort();
+            this.abortController = null;
+        }
+        
+        // Clear file state
+        this.__fileChanges = {};
+        this.__fileDeletions = {};
+        this.__fileExists = {};
+        
+        // Clear validation errors
+        this.__backendValidationErrors = {};
+        
+        // Clear changes tracking
+        this.__changes.clear();
+        
+        // Dispose relations if they have dispose method
+        this.__activeCurrentRelations.forEach(rel => {
+            if (this[rel] && typeof this[rel].dispose === 'function') {
+                this[rel].dispose();
+            }
+        });
     }
 }
